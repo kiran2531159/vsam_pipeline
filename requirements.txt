@@ -1,0 +1,4 @@
+faker>=18.0
+pyyaml>=6.0
+# Optional: for MostlyAI engine (local mode)
+# pip install 'mostlyai[local]'

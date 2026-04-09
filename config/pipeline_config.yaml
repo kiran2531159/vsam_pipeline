@@ -1,0 +1,42 @@
+# ════════════════════════════════════════════════════════════════════
+# VSAM Pipeline - Multi-Table Generation Config
+# ════════════════════════════════════════════════════════════════════
+# This YAML file drives the multi-table generation pipeline.
+# It defines copybooks, foreign key relationships, and output settings.
+
+pipeline:
+  encoding: ascii          # ascii | ebcdic
+  seed: 42                 # reproducibility seed (null for random)
+  locale: en_US            # Faker locale
+  ai_infer_types: true     # auto-detect semantic types from field names
+  parent_records: 500      # records for parent (root) tables
+  child_ratio: 3.0         # avg child records per parent
+  output_dir: output       # output directory
+  formats:                 # output formats to produce
+    - dat
+    - csv
+    - json
+
+# ── Copybook Definitions ─────────────────────────────────────────
+copybooks:
+  - path: sample_copybooks/customer.cpy
+    name: CUSTOMER-RECORD
+
+  - path: sample_copybooks/account.cpy
+    name: ACCOUNT-RECORD
+
+  - path: sample_copybooks/transaction.cpy
+    name: TRANSACTION-RECORD
+
+# ── Foreign Key Relationships ────────────────────────────────────
+# parent_field values will be propagated to child_field
+foreign_keys:
+  - parent_layout: CUSTOMER-RECORD
+    parent_field: CUST-ID
+    child_layout: ACCOUNT-RECORD
+    child_field: ACCT-CUST-ID
+
+  - parent_layout: ACCOUNT-RECORD
+    parent_field: ACCT-NUMBER
+    child_layout: TRANSACTION-RECORD
+    child_field: TXN-ACCT-NO
