@@ -1,0 +1,82 @@
+# ════════════════════════════════════════════════════════════════════
+# VSAM Pipeline - MostlyAI Multi-Table Generation Config
+# ════════════════════════════════════════════════════════════════════
+# Trains MostlyAI on sample CSV data, generates synthetic records,
+# and writes them as VSAM files via the matching copybook layouts.
+#
+# Relationship:  CUSTOMER ──(1:N)──> ACCOUNT ──(1:N)──> TRANSACTION
+# ════════════════════════════════════════════════════════════════════
+
+pipeline:
+  engine: mostlyai             # use MostlyAI engine (requires 'mostlyai[local]')
+  encoding: ascii              # ascii | ebcdic
+  seed: 42                     # reproducibility seed
+  locale: en_US
+  ai_infer_types: true
+  parent_records: 50           # synthetic customers to generate
+  child_ratio: 2.5             # ~2.5 accounts per customer, ~2.5 txns per account
+  output_dir: output/mostlyai  # output directory for generated VSAM files
+  formats:
+    - dat
+    - csv
+    - json
+
+  # MostlyAI-specific settings
+  mostlyai_seed_size: 15       # fallback seed size when no training data provided
+  mostlyai_max_training_time: 2  # max training time in minutes (keep short for demo)
+
+  # Combined VSAM output: merge all tables into a single file
+  combined_output: true          # enable combined VSAM merge
+  combined_copybook: sample_copybooks/combined_mai.cpy
+  # Record-type codes embedded in each combined record
+  record_type_map:
+    CUSTOMER-RECORD: CU
+    ACCOUNT-RECORD: AC
+    TRANSACTION-RECORD: TX
+
+# ── Copybook Definitions ─────────────────────────────────────────
+# Each copybook maps to a CSV training sample via training_data.
+# Column names in the CSV must match (or be normalizable to) the
+# copybook field names.
+copybooks:
+  - name: CUSTOMER-RECORD
+    path: sample_copybooks/customer_mai.cpy
+    training_data: sample_data/customers.csv
+    records: 50
+    key_field: CUST-ID
+    primary_key: CUST-ID         # used by MostlyAI for multi-table linking
+
+  - name: ACCOUNT-RECORD
+    path: sample_copybooks/account_mai.cpy
+    training_data: sample_data/accounts.csv
+    records: 0                   # auto: parent_records × child_ratio
+    key_field: ACCT-NUMBER
+    primary_key: ACCT-NUMBER     # used by MostlyAI for multi-table linking
+    foreign_keys:
+      - column: ACCT-CUST-ID
+        referenced_table: CUSTOMER-RECORD
+        is_context: true         # accounts belong to their customer's context
+
+  - name: TRANSACTION-RECORD
+    path: sample_copybooks/transaction_mai.cpy
+    training_data: sample_data/transactions.csv
+    records: 0                   # auto: parent_records × child_ratio²
+    key_field: TXN-ID
+    foreign_keys:
+      - column: TXN-ACCT-NO
+        referenced_table: ACCOUNT-RECORD
+        is_context: true         # transactions belong to their account's context
+
+# ── Foreign Key Relationships (VSAM pipeline-level linking) ──────
+# These tell the VSAM pipeline how to propagate parent key values
+# into child record fields when NOT using MostlyAI multi-table mode.
+foreign_keys:
+  - parent_layout: CUSTOMER-RECORD
+    parent_field: CUST-ID
+    child_layout: ACCOUNT-RECORD
+    child_field: ACCT-CUST-ID
+
+  - parent_layout: ACCOUNT-RECORD
+    parent_field: ACCT-NUMBER
+    child_layout: TRANSACTION-RECORD
+    child_field: TXN-ACCT-NO

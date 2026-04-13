@@ -1,4 +1,6 @@
 faker>=18.0
 pyyaml>=6.0
-# Optional: for MostlyAI engine (local mode)
-# pip install 'mostlyai[local]'
+pandas>=2.0,<3.0
+# MostlyAI engine (local mode) — install via:
+#   uv pip install 'mostlyai[local]'
+mostlyai[local]>=5.0

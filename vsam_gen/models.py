@@ -108,6 +108,11 @@ class GenerationConfig:
     mostlyai_max_training_time: Optional[int] = None
     # MostlyAI-specific: path to save/load trained generator zip
     mostlyai_generator_path: Optional[str] = None
+    # MostlyAI-specific: primary key column (for multi-table mode)
+    primary_key: Optional[str] = None
+    # MostlyAI-specific: foreign key configs for multi-table SDK training
+    # Each entry: {"column": "FK-COL", "referenced_table": "PARENT-TABLE", "is_context": True}
+    mostlyai_foreign_keys: list = field(default_factory=list)
 
 
 @dataclass

@@ -25,6 +25,7 @@ Generate realistic, production-like test data for mainframe VSAM files — direc
   - [4. VSAM File Output](#4-vsam-file-output)
   - [5. Multi-Table Linked Generation](#5-multi-table-linked-generation)
   - [6. YAML Config-Driven Pipeline](#6-yaml-config-driven-pipeline)
+  - [7. Combined Multi-Table VSAM Output](#7-combined-multi-table-vsam-output)
 - [Copybook Support](#copybook-support)
 - [Semantic Type Reference](#semantic-type-reference)
 - [Configuration Options](#configuration-options)
@@ -134,6 +135,7 @@ This pipeline **automates the entire process**: give it a copybook, get back pro
 | **CLI + API** | Use from command line or embed in Python applications |
 | **YAML Config** | Config-driven multi-table pipelines for complex scenarios |
 | **Dual Engine** | Choose Faker (fast, rule-based) or MostlyAI (AI-trained, statistically consistent) |
+| **Combined VSAM** | Merge multiple tables into a single VSAM file with REC-TYPE prefix (standard COBOL multi-record pattern) |
 | **Extensible** | Clean module architecture for adding new types/formats |
 
 ---
@@ -161,13 +163,24 @@ vsam_pipeline/
 │       └── vsam_writer.py             # VSAM fixed-length file writer
 ├── sample_copybooks/                  # Example COBOL copybooks
 │   ├── customer.cpy                   # Customer master record
+│   ├── customer_mai.cpy               # Customer layout (MostlyAI CSV format)
 │   ├── account.cpy                    # Account record (FK → Customer)
+│   ├── account_mai.cpy                # Account layout (MostlyAI CSV format)
 │   ├── transaction.cpy                # Transaction record (FK → Account)
+│   ├── transaction_mai.cpy            # Transaction layout (MostlyAI CSV format)
+│   ├── combined_mai.cpy               # Combined multi-table VSAM layout (REC-TYPE union)
 │   └── employee.cpy                   # Standalone employee record
+├── sample_data/                       # CSV training data for MostlyAI
+│   ├── customers.csv                  # 15 customer rows
+│   ├── accounts.csv                   # 25 account rows (FK → customers)
+│   └── transactions.csv               # 30 transaction rows (FK → accounts)
 ├── config/
-│   └── pipeline_config.yaml           # Multi-table YAML config example
+│   ├── pipeline_config.yaml           # Multi-table YAML config (Faker)
+│   └── mostlyai_pipeline.yaml         # Multi-table YAML config (MostlyAI + combined output)
 ├── tests/
-│   └── test_pipeline.py               # Test suite (42 tests)
+│   ├── test_pipeline.py               # Unit tests (63 tests)
+│   ├── test_mostlyai_integration.py   # MostlyAI integration tests (real SDK)
+│   └── run_mostlyai_e2e.py            # E2E test script (single + multi + combined)
 ├── output/                            # Generated data files (gitignored)
 ├── requirements.txt
 ├── setup.py
@@ -555,6 +568,171 @@ foreign_keys:
 python -m vsam_gen multi --config pipeline_config.yaml
 ```
 
+### 7. Combined Multi-Table VSAM Output
+
+In mainframe VSAM files, it's common to store **multiple record types in a single file**
+with a 2-byte record-type prefix (REC-TYPE) identifying each row. The pipeline supports
+this pattern natively: after generating individual tables, call `merge_to_combined_vsam()`
+to interleave them hierarchically into one combined VSAM file.
+
+#### How It Works
+
+```
+Customer 001
+  Account 001-A
+    Transaction 001-A-1
+    Transaction 001-A-2
+  Account 001-B
+    Transaction 001-B-1
+Customer 002
+  Account 002-A
+    ...
+```
+
+Each record is written at a **uniform fixed length** (the combined record length) with:
+
+| Bytes | Content |
+|---|---|
+| 0–1 | **REC-TYPE** — 2-char code identifying the source table (e.g. `CU`, `AC`, `TX`) |
+| 2–N | **Data fields** — placed at each field's copybook offset + 2 |
+| Remaining | Zero/space padding to fill the combined record length |
+
+#### Where Relationships Are Defined
+
+Relationships (foreign keys) are defined in **three places**, all equivalent:
+
+**1. Python API** — `add_foreign_key()` in [vsam_gen/pipeline.py](vsam_gen/pipeline.py#L84):
+```python
+pipeline.add_foreign_key(
+    parent_layout="CUSTOMER-RECORD",  parent_field="CUST-ID",
+    child_layout="ACCOUNT-RECORD",    child_field="ACCT-CUST-ID"
+)
+pipeline.add_foreign_key(
+    parent_layout="ACCOUNT-RECORD",   parent_field="ACCT-NUMBER",
+    child_layout="TRANSACTION-RECORD", child_field="TXN-ACCT-NO"
+)
+```
+
+**2. YAML config** — `foreign_keys` block in [config/mostlyai_pipeline.yaml](config/mostlyai_pipeline.yaml):
+```yaml
+foreign_keys:
+  - parent_layout: CUSTOMER-RECORD
+    parent_field: CUST-ID
+    child_layout: ACCOUNT-RECORD
+    child_field: ACCT-CUST-ID
+  - parent_layout: ACCOUNT-RECORD
+    parent_field: ACCT-NUMBER
+    child_layout: TRANSACTION-RECORD
+    child_field: TXN-ACCT-NO
+```
+
+**3. Copybook comments** — documented in the `.cpy` files themselves:
+```cobol
+      * Foreign key: ACCT-CUST-ID -> CUSTOMER-RECORD.CUST-ID
+       01  ACCOUNT-RECORD.
+           05  ACCT-NUMBER     PIC 9(12).
+           05  ACCT-CUST-ID    PIC 9(10).   <-- FK to Customer
+```
+
+#### Python API
+
+```python
+from vsam_gen import VsamPipeline
+
+pipeline = VsamPipeline()
+pipeline.load_copybook("sample_copybooks/customer_mai.cpy")
+pipeline.load_copybook("sample_copybooks/account_mai.cpy")
+pipeline.load_copybook("sample_copybooks/transaction_mai.cpy")
+
+pipeline.add_foreign_key("CUSTOMER-RECORD", "CUST-ID", "ACCOUNT-RECORD", "ACCT-CUST-ID")
+pipeline.add_foreign_key("ACCOUNT-RECORD", "ACCT-NUMBER", "TRANSACTION-RECORD", "TXN-ACCT-NO")
+
+# Step 1: Generate individual tables
+results = pipeline.generate_all(parent_records=500, child_ratio=3.0, output_dir="output")
+
+# Step 2: Merge into a single combined VSAM file
+combined = pipeline.merge_to_combined_vsam(
+    results=results,
+    output_dir="output",
+    combined_copybook="sample_copybooks/combined_mai.cpy",  # optional union copybook
+    record_type_map={
+        "CUSTOMER-RECORD": "CU",
+        "ACCOUNT-RECORD": "AC",
+        "TRANSACTION-RECORD": "TX",
+    },
+)
+
+print(combined["stats"])
+# {"total_records": 7000, "combined_record_length": 370,
+#  "total_bytes": 2590000, "record_type_counts": {"CU": 500, "AC": 1500, "TX": 5000}}
+print(combined["files"])
+# {"dat": "output/combined.dat", "csv": "output/combined.csv", "json": "output/combined.json"}
+```
+
+#### YAML Config
+
+```yaml
+# config/mostlyai_pipeline.yaml (relevant sections)
+pipeline:
+  combined_output: true
+  combined_copybook: sample_copybooks/combined_mai.cpy
+  record_type_map:
+    CUSTOMER-RECORD: CU
+    ACCOUNT-RECORD: AC
+    TRANSACTION-RECORD: TX
+```
+
+When `combined_output: true` is set, the CLI `multi` command automatically merges
+all tables into a single combined VSAM file after generation.
+
+#### Combined Copybook Layout
+
+The combined copybook ([sample_copybooks/combined_mai.cpy](sample_copybooks/combined_mai.cpy))
+defines the union record structure:
+
+```cobol
+       01  COMBINED-RECORD.
+           05  REC-TYPE           PIC X(02).    *> "CU", "AC", or "TX"
+      * --- Customer fields ---
+           05  CUST-ID            PIC 9(10).
+           05  CUST-FIRST-NAME    PIC X(25).
+           ...
+      * --- Account fields ---
+           05  ACCT-NUMBER        PIC 9(12).
+           05  ACCT-CUST-ID       PIC 9(10).
+           ...
+      * --- Transaction fields ---
+           05  TXN-ID             PIC 9(12).
+           05  TXN-ACCT-NO        PIC 9(12).
+           ...
+```
+
+#### `merge_to_combined_vsam()` Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `results` | dict | required | Output from `generate_all()` or `generate_all_mostlyai()` |
+| `output_dir` | str | `"output"` | Directory for combined output files |
+| `combined_copybook` | str | None | Path to union copybook; if None, auto-computes length as `2 + max(individual)` |
+| `record_type_map` | dict | None | Layout name → 2-char code map; if None, auto-generated from first 2 chars |
+| `formats` | list | `["dat","csv","json"]` | Output formats to produce |
+
+#### Return Value
+
+```python
+{
+    "combined_records": [...],   # list of {"_type": "CU", "_table": "CUSTOMER-RECORD", "_record": {...}}
+    "files": {"dat": "...", "csv": "...", "json": "..."},
+    "stats": {
+        "total_records": 7000,
+        "combined_record_length": 370,
+        "total_bytes": 2590000,
+        "record_type_counts": {"CU": 500, "AC": 1500, "TX": 5000},
+    },
+    "record_type_map": {"CUSTOMER-RECORD": "CU", ...},
+}
+```
+
 ---
 
 ## Copybook Support
@@ -752,12 +930,12 @@ The project includes four sample copybooks demonstrating different patterns:
 - FILLER padding
 
 ### Account (`sample_copybooks/account.cpy`)
-- Foreign key to Customer (ACCT-CUST-ID → CUST-ID)
+- **Foreign key**: `ACCT-CUST-ID` → `CUSTOMER-RECORD.CUST-ID`
 - Signed decimal amounts (balance, credit limit)
 - Interest rate with 4 decimal places
 
 ### Transaction (`sample_copybooks/transaction.cpy`)
-- Foreign key to Account (TXN-ACCT-NO → ACCT-NUMBER)
+- **Foreign key**: `TXN-ACCT-NO` → `ACCOUNT-RECORD.ACCT-NUMBER`
 - Date + time fields
 - Transaction description text
 - Merchant information
@@ -766,6 +944,15 @@ The project includes four sample copybooks demonstrating different patterns:
 - Standalone record (no foreign keys)
 - COMP-3 salary
 - Department code
+
+### Combined (`sample_copybooks/combined_mai.cpy`)
+- **Union layout** for all 3 tables (Customer + Account + Transaction)
+- `REC-TYPE PIC X(02)` prefix identifies the record type (`CU`/`AC`/`TX`)
+- All fields from all 3 tables at fixed offsets
+- Used with `merge_to_combined_vsam()` for single-file multi-record-type VSAM output
+
+### MostlyAI Variants
+- `customer_mai.cpy`, `account_mai.cpy`, `transaction_mai.cpy` — flat layouts matching the CSV training data in `sample_data/`
 
 ---
 
@@ -798,8 +985,29 @@ python -m pytest tests/test_pipeline.py::TestMostlyAIEngine -v
 | `TestSyntheticEngine` | 6 | Record generation, field lengths, unique keys, seeds, overrides |
 | `TestVsamWriter` | 4 | DAT/CSV/JSON output, fixed-length validation |
 | `TestPipeline` | 7 | End-to-end string/file, describe, multi-table FK, engine selection |
-| `TestMostlyAIEngine` | 5 | Import guard, value formatting, DataFrame conversion, seed bootstrap |
-| **Total** | **42** | |
+| `TestCombinedVsamMerge` | 13 | Combined DAT/CSV/JSON, record counts, hierarchical ordering, 3-table merge, auto type map |
+| `TestMostlyAIEngine` | 13 | Import guard, value formatting, DataFrame conversion, seed bootstrap, structured file loading |
+| **Total** | **63** | |
+
+### MostlyAI E2E Tests
+
+End-to-end tests that use the real MostlyAI SDK (requires `mostlyai[local]` installed):
+
+```bash
+# Single-table (~10 min)
+python tests/run_mostlyai_e2e.py
+
+# Multi-table with combined VSAM merge (~18 min)
+python tests/run_mostlyai_e2e.py --multi
+
+# All tests
+python tests/run_mostlyai_e2e.py --all
+```
+
+| E2E Test | Duration | What's Covered |
+|---|:---:|---|
+| `test_single_table_customer` | ~10 min | CSV → MostlyAI train → generate → copybook format → VSAM files |
+| `test_multi_table` | ~18 min | 3-table linked generation + combined VSAM merge + hierarchical interleaving |
 
 ---
 

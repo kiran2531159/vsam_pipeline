@@ -140,9 +140,11 @@ def _cmd_multi(args):
 
     pipeline = VsamPipeline(config)
 
-    # Load copybooks
+    # Load copybooks with per-table settings from YAML
+    copybook_configs = {}
     for cb in cfg.get("copybooks", []):
-        pipeline.load_copybook(cb["path"], name=cb.get("name"))
+        layout = pipeline.load_copybook(cb["path"], name=cb.get("name"))
+        copybook_configs[layout.name] = cb
 
     # Add foreign keys
     for fk in cfg.get("foreign_keys", []):
@@ -151,19 +153,49 @@ def _cmd_multi(args):
             fk["child_layout"], fk["child_field"],
         )
 
-    # Generate
-    results = pipeline.generate_all(
-        parent_records=pipeline_cfg.get("parent_records", 500),
-        child_ratio=pipeline_cfg.get("child_ratio", 3.0),
-        output_dir=pipeline_cfg.get("output_dir", "output"),
-        formats=pipeline_cfg.get("formats", ["dat", "csv", "json"]),
-    )
+    # Choose generation strategy
+    if engine_str == "mostlyai" and any(
+        cb.get("foreign_keys") for cb in cfg.get("copybooks", [])
+    ):
+        # Multi-table MostlyAI mode: train all tables together
+        results = pipeline.generate_all_mostlyai(
+            copybook_configs=copybook_configs,
+            output_dir=pipeline_cfg.get("output_dir", "output"),
+            formats=pipeline_cfg.get("formats", ["dat", "csv", "json"]),
+            parent_records=pipeline_cfg.get("parent_records", 500),
+            child_ratio=pipeline_cfg.get("child_ratio", 3.0),
+        )
+    else:
+        # Standard mode: per-table generation with FK propagation
+        # Pass per-copybook training_data into pipeline
+        pipeline.set_copybook_configs(copybook_configs)
+        results = pipeline.generate_all(
+            parent_records=pipeline_cfg.get("parent_records", 500),
+            child_ratio=pipeline_cfg.get("child_ratio", 3.0),
+            output_dir=pipeline_cfg.get("output_dir", "output"),
+            formats=pipeline_cfg.get("formats", ["dat", "csv", "json"]),
+        )
 
     print(f"\nMulti-table generation complete:")
     for name, result in results.items():
         print(f"\n  {name}:")
         print(f"    Records: {result['stats']['record_count']:,}")
         print(f"    Files:   {list(result['files'].values())}")
+
+    # ── Combined VSAM merge ───────────────────────────────────────────
+    if pipeline_cfg.get("combined_output"):
+        combined = pipeline.merge_to_combined_vsam(
+            results=results,
+            output_dir=pipeline_cfg.get("output_dir", "output"),
+            combined_copybook=pipeline_cfg.get("combined_copybook"),
+            record_type_map=pipeline_cfg.get("record_type_map"),
+            formats=pipeline_cfg.get("formats", ["dat", "csv", "json"]),
+        )
+        print(f"\n  COMBINED VSAM:")
+        print(f"    Total records: {combined['stats']['total_records']:,}")
+        print(f"    Record length: {combined['stats']['combined_record_length']} bytes")
+        print(f"    Type counts:   {combined['stats']['record_type_counts']}")
+        print(f"    Files:         {list(combined['files'].values())}")
 
 
 if __name__ == "__main__":

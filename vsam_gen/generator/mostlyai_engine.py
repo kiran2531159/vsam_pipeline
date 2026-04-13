@@ -93,7 +93,7 @@ class MostlyAIEngine:
         from mostlyai.sdk import MostlyAI
 
         n = num_records or self.config.num_records
-        mostly = MostlyAI()
+        mostly = MostlyAI(local=True, quiet=True)
 
         # ── Step 1: Get seed data ────────────────────────────────────────
         seed_df = self._get_seed_dataframe()

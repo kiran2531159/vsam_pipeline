@@ -401,6 +401,262 @@ class TestPipeline:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Combined VSAM Merge Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ACCOUNT_COPYBOOK = """
+       01  ACCOUNT-RECORD.
+           05  ACCT-ID         PIC 9(08).
+           05  ACCT-CUST-ID    PIC 9(06).
+           05  ACCT-TYPE       PIC X(02).
+           05  ACCT-BALANCE    PIC S9(07)V99.
+"""
+
+TRANSACTION_COPYBOOK = """
+       01  TRANSACTION-RECORD.
+           05  TXN-ID          PIC 9(10).
+           05  TXN-ACCT-ID     PIC 9(08).
+           05  TXN-AMOUNT      PIC S9(07)V99.
+           05  TXN-DATE        PIC 9(08).
+"""
+
+
+class TestCombinedVsamMerge:
+    """Tests for merge_to_combined_vsam() method."""
+
+    PARENT_CPY = """
+       01  PARENT-REC.
+           05  PAR-ID          PIC 9(06).
+           05  PAR-NAME        PIC X(20).
+           05  PAR-STATUS      PIC X(01).
+    """
+    CHILD_CPY = """
+       01  CHILD-REC.
+           05  CHD-ID          PIC 9(08).
+           05  CHD-PAR-ID      PIC 9(06).
+           05  CHD-AMOUNT      PIC S9(07)V99.
+           05  CHD-DATE        PIC 9(08).
+    """
+
+    def _make_pipeline_with_results(self, tmpdir, parent_count=3, child_ratio=2.0):
+        """Create a pipeline, generate Faker data, return (pipeline, results)."""
+        config = GenerationConfig(seed=42)
+        pipeline = VsamPipeline(config)
+        pipeline.load_copybook_string(self.PARENT_CPY, name="PARENT-REC")
+        pipeline.load_copybook_string(self.CHILD_CPY, name="CHILD-REC")
+        pipeline.add_foreign_key("PARENT-REC", "PAR-ID", "CHILD-REC", "CHD-PAR-ID")
+
+        results = pipeline.generate_all(
+            parent_records=parent_count,
+            child_ratio=child_ratio,
+            output_dir=tmpdir,
+        )
+        return pipeline, results
+
+    def test_merge_basic(self):
+        """merge_to_combined_vsam produces DAT, CSV, JSON files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results,
+                output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+            )
+            assert "dat" in combined["files"]
+            assert "csv" in combined["files"]
+            assert "json" in combined["files"]
+            for path in combined["files"].values():
+                assert os.path.exists(path)
+
+    def test_merge_record_count(self):
+        """Total combined records = sum of per-table records."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir, 4, 3.0)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+            )
+            total = combined["stats"]["total_records"]
+            sum_individual = sum(r["stats"]["record_count"] for r in results.values())
+            assert total == sum_individual
+
+    def test_merge_dat_size(self):
+        """DAT file size = total_records × combined_record_length."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+            )
+            dat_path = combined["files"]["dat"]
+            expected = combined["stats"]["total_records"] * combined["stats"]["combined_record_length"]
+            actual = os.path.getsize(dat_path)
+            assert actual == expected
+
+    def test_merge_record_type_counts(self):
+        """Per-type counts match original per-table record counts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir, 5, 2.0)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+            )
+            counts = combined["stats"]["record_type_counts"]
+            assert counts["PA"] == results["PARENT-REC"]["stats"]["record_count"]
+            assert counts["CH"] == results["CHILD-REC"]["stats"]["record_count"]
+
+    def test_merge_csv_has_all_columns(self):
+        """Combined CSV has REC-TYPE plus fields from both layouts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+            )
+            import csv as csv_mod
+            with open(combined["files"]["csv"]) as f:
+                reader = csv_mod.reader(f)
+                header = next(reader)
+            assert "REC-TYPE" in header
+            assert "PAR-ID" in header
+            assert "CHD-ID" in header
+
+    def test_merge_json_has_table_metadata(self):
+        """Combined JSON records include _table field."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+            )
+            with open(combined["files"]["json"]) as f:
+                data = json.load(f)
+            tables = {r["_table"] for r in data}
+            assert "PARENT-REC" in tables
+            assert "CHILD-REC" in tables
+
+    def test_merge_hierarchical_ordering(self):
+        """Parent records appear before their children in the output."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir, 3, 2.0)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+            )
+            records = combined["combined_records"]
+            # Track: each PA should appear before its CH children
+            last_parent_idx = {}
+            for i, entry in enumerate(records):
+                rec = entry["_record"]
+                if entry["_type"] == "PA":
+                    par_id = rec.get("PAR-ID", "").strip()
+                    last_parent_idx[par_id] = i
+                elif entry["_type"] == "CH":
+                    child_par_id = rec.get("CHD-PAR-ID", "").strip()
+                    if child_par_id in last_parent_idx:
+                        assert i > last_parent_idx[child_par_id], \
+                            f"Child at {i} should come after parent at {last_parent_idx[child_par_id]}"
+
+    def test_merge_auto_record_type_map(self):
+        """Auto-generated type map produces 2-char codes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir)
+            # Don't pass record_type_map — let it auto-generate
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+            )
+            rtm = combined["record_type_map"]
+            assert len(rtm) == 2
+            for name, code in rtm.items():
+                assert len(code) == 2
+                assert code == code.upper()
+
+    def test_merge_dat_format(self):
+        """DAT records start with the 2-byte record type code."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir, 2, 1.0)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+            )
+            rec_len = combined["stats"]["combined_record_length"]
+            with open(combined["files"]["dat"], "rb") as f:
+                data = f.read()
+            # Each record should be rec_len bytes
+            assert len(data) % rec_len == 0
+            # First record should start with PA or CH
+            first_type = data[:2].decode("ascii").strip()
+            assert first_type in ("PA", "CH")
+
+    def test_merge_empty_results_raises(self):
+        """merge_to_combined_vsam raises ValueError on empty results."""
+        pipeline = VsamPipeline()
+        with pytest.raises(ValueError, match="No results to merge"):
+            pipeline.merge_to_combined_vsam(results={}, output_dir="/tmp")
+
+    def test_merge_formats_filter(self):
+        """Can request only specific output formats."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+                formats=["csv"],
+            )
+            assert "csv" in combined["files"]
+            assert "dat" not in combined["files"]
+            assert "json" not in combined["files"]
+
+    def test_merge_three_tables(self):
+        """Three-level hierarchy: parent → child → grandchild."""
+        grandchild_cpy = """
+       01  GRANDCHILD-REC.
+           05  GC-ID           PIC 9(10).
+           05  GC-CHD-ID       PIC 9(08).
+           05  GC-VALUE        PIC X(15).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GenerationConfig(seed=42)
+            pipeline = VsamPipeline(config)
+            pipeline.load_copybook_string(self.PARENT_CPY, name="PARENT-REC")
+            pipeline.load_copybook_string(self.CHILD_CPY, name="CHILD-REC")
+            pipeline.load_copybook_string(grandchild_cpy, name="GRANDCHILD-REC")
+            pipeline.add_foreign_key("PARENT-REC", "PAR-ID", "CHILD-REC", "CHD-PAR-ID")
+            pipeline.add_foreign_key("CHILD-REC", "CHD-ID", "GRANDCHILD-REC", "GC-CHD-ID")
+
+            results = pipeline.generate_all(
+                parent_records=2,
+                child_ratio=2.0,
+                output_dir=tmpdir,
+            )
+
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={
+                    "PARENT-REC": "PA", "CHILD-REC": "CH", "GRANDCHILD-REC": "GC",
+                },
+            )
+
+            counts = combined["stats"]["record_type_counts"]
+            assert counts["PA"] == 2
+            assert counts["CH"] == 4
+            assert counts["GC"] == 8
+            assert combined["stats"]["total_records"] == 14
+
+    def test_merge_combined_record_length(self):
+        """Combined record length = 2 (REC-TYPE) + max(individual record lengths)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline, results = self._make_pipeline_with_results(tmpdir)
+            combined = pipeline.merge_to_combined_vsam(
+                results=results, output_dir=tmpdir,
+                record_type_map={"PARENT-REC": "PA", "CHILD-REC": "CH"},
+            )
+            max_individual = max(r["layout"].record_length for r in results.values())
+            expected_len = 2 + max_individual
+            assert combined["stats"]["combined_record_length"] == expected_len
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MostlyAI Engine Tests (mocked — no actual SDK needed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
